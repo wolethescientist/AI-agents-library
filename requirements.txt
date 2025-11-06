@@ -1,0 +1,17 @@
+# Core Framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# AI Service
+google-generativeai==0.8.3
+
+# Configuration
+python-dotenv==1.0.1
+
+# Frontend Testing Interface
+streamlit==1.39.0
+
+# HTTP Client (for potential future use)
+httpx==0.27.2
