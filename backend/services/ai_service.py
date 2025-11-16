@@ -407,3 +407,34 @@ class AIService:
         logger.debug(f"Cleaned response (length: {len(cleaned)} chars)")
         
         return cleaned
+    
+    def is_document_related_query(
+        self,
+        message: str,
+        has_active_session: bool
+    ) -> bool:
+        """Determine if a query is document-related.
+        
+        When a document session is active, we default to treating ALL queries
+        as document-related. This allows the RAG system to intelligently decide
+        whether to use document context or fall back to general knowledge.
+        
+        This approach is more robust than keyword-based heuristics because:
+        1. Users naturally refer to uploaded content without explicit keywords
+        2. The AI can see the document context and decide relevance
+        3. No false negatives from missing keyword patterns
+        
+        Args:
+            message: The user's query message
+            has_active_session: Whether a document session is currently active
+        
+        Returns:
+            True if a document session is active, False otherwise
+        """
+        if not has_active_session:
+            return False
+        
+        # When a document is uploaded, assume all queries are document-related
+        # The RAG system will handle context intelligently
+        logger.debug("Document query detected (active session present)")
+        return True

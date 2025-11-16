@@ -16,7 +16,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.config import Settings, configure_logging
 from backend.agents.config import AgentManager, AGENTS
 from backend.services.ai_service import AIService
-from backend.api.v1 import agents, health
+from backend.services.document_processor import DocumentProcessor
+from backend.services.embedding_service import EmbeddingService
+from backend.services.session_manager import SessionManager
+from backend.services.rag_service import RAGService
+from backend.api.v1 import agents, health, documents
 from backend.api.exceptions import register_exception_handlers
 from backend.middleware.logging import LoggingMiddleware
 from backend.middleware.rate_limit import RateLimitMiddleware
@@ -67,6 +71,12 @@ async def lifespan(app: FastAPI):
         logger.info("AI Service initialized successfully")
         logger.info(f"  - Gemini API configured: ✓")
         
+        # Start RAG session manager
+        session_manager = app.state.session_manager
+        await session_manager.start()
+        logger.info("RAG Session Manager started")
+        logger.info(f"  - Default TTL: {session_manager.default_ttl_minutes} minutes")
+        
         logger.info("=" * 60)
         logger.info("Application startup complete")
         logger.info("=" * 60)
@@ -79,6 +89,11 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down Multi-Agent Learning Chat API")
+    
+    # Stop session manager and cleanup
+    if hasattr(app.state, 'session_manager'):
+        await app.state.session_manager.stop()
+        logger.info("RAG Session Manager stopped")
 
 
 def create_app() -> FastAPI:
@@ -109,12 +124,21 @@ def create_app() -> FastAPI:
     agent_manager = AgentManager(AGENTS)
     ai_service = AIService(settings, agent_manager)
     
+    # Initialize RAG services
+    document_processor = DocumentProcessor(chunk_size=800, chunk_overlap=100)
+    embedding_service = EmbeddingService(model_name="all-MiniLM-L6-v2", max_workers=4)
+    session_manager = SessionManager(default_ttl_minutes=20)
+    rag_service = RAGService(settings, session_manager, embedding_service, document_processor)
+    
     # Store services in app state
     app.state.agent_manager = agent_manager
     app.state.ai_service = ai_service
+    app.state.session_manager = session_manager
+    app.state.rag_service = rag_service
     
     # Set services for router dependency injection
-    agents.set_services(agent_manager, ai_service)
+    agents.set_services(agent_manager, ai_service, rag_service)  # Added rag_service
+    documents.set_rag_service(rag_service)
     
     # Configure CORS with environment-based origins
     app.add_middleware(
@@ -142,6 +166,7 @@ def create_app() -> FastAPI:
     
     # Include v1 API routers
     app.include_router(agents.router)
+    app.include_router(documents.router)
     app.include_router(health.router)
     
     # Root endpoint for basic info

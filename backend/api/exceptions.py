@@ -4,6 +4,7 @@ Ensures consistent error response format across all endpoints.
 """
 import logging
 import asyncio
+from typing import Optional, Dict, Any
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError, HTTPException
@@ -13,6 +14,35 @@ from backend.models.responses import ErrorResponse, ErrorDetail
 
 
 logger = logging.getLogger(__name__)
+
+
+def create_detailed_error_response(
+    code: int,
+    message: str,
+    details: Optional[Dict[str, Any]] = None,
+    suggestion: Optional[str] = None
+) -> ErrorResponse:
+    """
+    Create a detailed error response with helpful context for frontend developers.
+    
+    Args:
+        code: HTTP status code
+        message: Main error message
+        details: Additional error details (field errors, validation info, etc.)
+        suggestion: Helpful suggestion for fixing the error
+        
+    Returns:
+        ErrorResponse with comprehensive error information
+    """
+    error_detail = ErrorDetail(code=code, message=message)
+    
+    # Add optional fields if provided
+    if details:
+        error_detail.details = details
+    if suggestion:
+        error_detail.suggestion = suggestion
+    
+    return ErrorResponse(error=error_detail)
 
 
 async def validation_exception_handler(
@@ -35,30 +65,43 @@ async def validation_exception_handler(
     # Extract validation error details
     errors = exc.errors()
     
-    # Build user-friendly error message
-    if len(errors) == 1:
-        error = errors[0]
-        field = " -> ".join(str(loc) for loc in error["loc"] if loc != "body")
-        message = f"Validation error in field '{field}': {error['msg']}"
+    # Build detailed error information for frontend developers
+    field_errors = []
+    for error in errors:
+        # Get the field path (excluding 'body')
+        field_path = [str(loc) for loc in error["loc"] if loc != "body"]
+        field_name = " -> ".join(field_path) if field_path else "request"
+        
+        field_errors.append({
+            "field": field_name,
+            "message": error["msg"],
+            "type": error["type"],
+            "input": error.get("input")
+        })
+    
+    # Build user-friendly main message
+    if len(field_errors) == 1:
+        error = field_errors[0]
+        message = f"Validation error in '{error['field']}': {error['message']}"
     else:
-        error_messages = []
-        for error in errors:
-            field = " -> ".join(str(loc) for loc in error["loc"] if loc != "body")
-            error_messages.append(f"{field}: {error['msg']}")
-        message = "Validation errors: " + "; ".join(error_messages)
+        message = f"Request validation failed with {len(field_errors)} error(s)"
     
     # Log the validation error
     logger.warning(
         f"Validation error for {request.method} {request.url.path}: {message}",
-        extra={"errors": errors}
+        extra={"errors": errors, "request_body": await request.body()}
     )
     
-    # Create error response
-    error_response = ErrorResponse(
-        error=ErrorDetail(
-            code=status.HTTP_400_BAD_REQUEST,
-            message=message
-        )
+    # Create detailed error response
+    error_response = create_detailed_error_response(
+        code=status.HTTP_400_BAD_REQUEST,
+        message=message,
+        details={
+            "validation_errors": field_errors,
+            "endpoint": str(request.url.path),
+            "method": request.method
+        },
+        suggestion="Check the API documentation for required fields and data types. Ensure all required fields are present and have the correct format."
     )
     
     return JSONResponse(
@@ -91,12 +134,33 @@ async def http_exception_handler(
         f"HTTP {exc.status_code} for {request.method} {request.url.path}: {exc.detail}"
     )
     
-    # Create error response
-    error_response = ErrorResponse(
-        error=ErrorDetail(
-            code=exc.status_code,
-            message=str(exc.detail)
-        )
+    # Add helpful suggestions based on status code
+    suggestion = None
+    details = {
+        "endpoint": str(request.url.path),
+        "method": request.method
+    }
+    
+    if exc.status_code == 404:
+        suggestion = "Verify the endpoint URL and any resource IDs (agent_id, session_id) are correct. Check the API documentation for valid endpoints."
+    elif exc.status_code == 413:
+        suggestion = "Reduce the file size or compress the file before uploading. Maximum allowed size is 30 MB."
+    elif exc.status_code == 422:
+        suggestion = "Ensure the file type is supported. Allowed types: PDF, PNG, JPG, JPEG, HEIC."
+    elif exc.status_code == 429:
+        suggestion = "You've exceeded the rate limit. Wait a moment before retrying. Consider implementing exponential backoff in your client."
+        details["retry_after"] = exc.headers.get("Retry-After") if hasattr(exc, "headers") else None
+    elif exc.status_code == 504:
+        suggestion = "The request took too long to process. Try with a smaller file, simpler query, or retry the request."
+    elif exc.status_code >= 500:
+        suggestion = "This is a server-side error. Please try again in a few moments. If the issue persists, contact support."
+    
+    # Create detailed error response
+    error_response = create_detailed_error_response(
+        code=exc.status_code,
+        message=str(exc.detail),
+        details=details,
+        suggestion=suggestion
     )
     
     return JSONResponse(
@@ -128,12 +192,29 @@ async def timeout_exception_handler(
         extra={"exception_type": type(exc).__name__}
     )
     
-    # Create error response with helpful message
-    error_response = ErrorResponse(
-        error=ErrorDetail(
-            code=status.HTTP_504_GATEWAY_TIMEOUT,
-            message="Request timed out. Please try again or simplify your question."
-        )
+    # Determine timeout context based on endpoint
+    is_file_upload = "file" in str(request.url.path).lower() or request.method == "POST"
+    
+    message = "Request timed out while processing"
+    suggestion = "Retry the request. "
+    
+    if is_file_upload:
+        message = "File processing timed out. The file may be too large or complex."
+        suggestion += "Try with a smaller file, reduce file complexity (fewer pages/lower resolution), or increase client timeout settings."
+    else:
+        message = "Request timed out. The operation took too long to complete."
+        suggestion += "Simplify your query, reduce the amount of data being processed, or increase client timeout settings."
+    
+    # Create detailed error response
+    error_response = create_detailed_error_response(
+        code=status.HTTP_504_GATEWAY_TIMEOUT,
+        message=message,
+        details={
+            "endpoint": str(request.url.path),
+            "method": request.method,
+            "timeout_type": "processing"
+        },
+        suggestion=suggestion
     )
     
     return JSONResponse(
@@ -150,14 +231,14 @@ async def general_exception_handler(
     Handle unexpected errors (500 Internal Server Error).
     
     Catches all unhandled exceptions to prevent server crashes.
-    Logs detailed error information while returning generic message to users.
+    Logs detailed error information while returning helpful message to developers.
     
     Args:
         request: The incoming request
         exc: The exception
         
     Returns:
-        JSONResponse with 500 status and generic error message
+        JSONResponse with 500 status and helpful error message
     """
     # Log the full exception with stack trace
     logger.error(
@@ -169,12 +250,38 @@ async def general_exception_handler(
         }
     )
     
-    # Return generic error message (don't expose internal details)
-    error_response = ErrorResponse(
-        error=ErrorDetail(
-            code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            message="AI service temporarily unavailable. Please try again later."
-        )
+    # Provide helpful context based on exception type
+    exception_type = type(exc).__name__
+    message = "An unexpected error occurred while processing your request"
+    
+    details = {
+        "endpoint": str(request.url.path),
+        "method": request.method,
+        "error_type": exception_type
+    }
+    
+    # Add specific guidance for common exception types
+    suggestion = "Please try again. If the issue persists, contact support with the error details."
+    
+    if "Connection" in exception_type or "Network" in exception_type:
+        message = "Network or connection error occurred"
+        suggestion = "Check network connectivity and ensure all required services (OpenAI API, database) are accessible. Verify API keys and credentials are correct."
+    elif "Timeout" in exception_type:
+        message = "Operation timed out"
+        suggestion = "The operation took too long. Try with smaller inputs or increase timeout settings."
+    elif "Memory" in exception_type:
+        message = "Memory limit exceeded"
+        suggestion = "The operation required too much memory. Try processing smaller files or reducing batch sizes."
+    elif "Permission" in exception_type or "Auth" in exception_type:
+        message = "Permission or authentication error"
+        suggestion = "Verify API keys and credentials are correctly configured in environment variables."
+    
+    # Create detailed error response
+    error_response = create_detailed_error_response(
+        code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        message=message,
+        details=details,
+        suggestion=suggestion
     )
     
     return JSONResponse(
